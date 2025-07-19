@@ -11,32 +11,105 @@ const WATCH_DIR = process.cwd();
 const IGNORED = /(^|[\/\\])\.git/;
 const STATS_FILE = path.join(WATCH_DIR, 'repo-stats.txt');
 const BATCH_INTERVAL_MS = .25 * 60 * 1000;
+const PULL_INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 
 // Initialize Git
 const git = simpleGit(WATCH_DIR);
 
-// Verbose logging helpers
-function logInfo(msg) { console.log(`[INFO] ${msg}`); }
-function logWarn(msg) { console.warn(`[WARN] ${msg}`); }
-function logError(msg) { console.error(`[ERROR] ${msg}`); }
-
 // Global batch timer
 let batchTimer = null;
-let pendingChanges = false;
+let pullTimer = null;
+// let pendingChanges = false;
+
+class Submodule {
+	constructor(name, path) {
+		this.name = name;
+		this.path = path;
+		this.git = simpleGit(path);
+	}
+}
+
+let submodules = [];
 
 class StateManager {
 	constructor() {
-		this.currentState = "idle";
+		this.currentState = "initializing";
 		// "idle"
 		// "pending" – changes detected, waiting to commit
 		// "committing"
 		// "pulling"
 		// "blocked" – bad repo state (detached head, merge conflict, etc.)
 		// "error" – encountered unrecoverable error (optional)
-		this.commitTimeout = null;
-		this.timeoutDelay = 5000;
+	}
+	init() {
+		logInfo('State manager initialized.');
+		this.setState("idle");
+		setInterval(() => {
+			// Only print state when idle
+			if (this.currentState === "idle") {
+				const nextPullMs = PULL_INTERVAL_MS - (Date.now() % PULL_INTERVAL_MS);
+				logInfo(
+					`State: ${this.currentState} | Next pull in: ${(nextPullMs / 1000).toFixed(1)}s`
+				);
+			}
+		}, 10000);
+	}
+
+	setState(newState) {
+		if (this.currentState !== newState) {
+			logInfo(`State changed: ${this.currentState} -> ${newState}`);
+			this.currentState = newState;
+		}
+	}
+
+	processDone() {
+		// if batch timer is running set to pedning, otherwise set to idle
+		if (batchTimer) {
+			this.setState("pending");
+		} else {
+			this.setState("idle");
+		}
+	}
+
+	maybePull() {
+		if (this.currentState === "idle") {
+			// Only pull if we're idle and no pending changes
+			logInfo('Checking for remote changes...');
+			this.setState('pulling');
+			pullUpdates()
+				.then(() => {
+					logInfo('Pull completed successfully.');
+					this.setState("idle");
+				})
+				.catch(err => {
+					logError(`Pull failed: ${err.message}`);
+					this.setState("error");
+				});
+		} else {
+			logInfo('Skipping pull, current state:' + this.currentState);
+		}
+	}
+
+	// File change handler
+	onChange(event, filePath) {
+		this.setState("pending");
+		logInfo(`Detected ${event} on ${filePath}`);
+		if (batchTimer) {
+			clearTimeout(batchTimer);
+			logInfo('Cleared previous batch timer');
+		}
+		batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
+		logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
 	}
 }
+
+let stateManager = new StateManager();
+
+// Verbose logging helpers
+function logInfo(msg) { console.log(`[INFO] [${new Date().toISOString()}] [${stateManager.currentState}] ${msg}`); }
+function logWarn(msg) { console.warn(`[WARN] [${new Date().toISOString()}] [${stateManager.currentState}] ${msg}`); }
+function logError(msg) { console.error(`[ERROR] [${new Date().toISOString()}] [${stateManager.currentState}] ${msg}`); }
+
 
 // Pre-checks before watching
 async function verifyRepo() {
@@ -119,6 +192,10 @@ async function verifyRepo() {
 			while ((m = pathRe.exec(gm)) !== null) {
 				const subRel = m[1].trim();
 				const subFull = path.join(WATCH_DIR, subRel);
+
+				// Add to submodules for later use
+				submodules.push(new Submodule(subRel, subFull));
+
 				if (fs.existsSync(subFull)) {
 					try {
 						// mark as safe.directory
@@ -147,8 +224,6 @@ async function verifyRepo() {
 			logWarn(`Could not mark superproject safe: ${e.message}`);
 		}
 		// ————————————————————————————————————————
-
-
 
 	} catch (err) {
 		logError(`Repository verification failed: ${err.message}`);
@@ -194,8 +269,8 @@ async function writeStatsFile(data) {
 
 // Batched commit and push function
 async function batchedCommit() {
-	if (!pendingChanges) return;
 	logInfo('Performing batched commit...');
+	stateManager.setState("committing");
 
 	// Create base commit message object
 	const baseCommitObj = {
@@ -302,39 +377,48 @@ async function batchedCommit() {
 		logInfo('No superproject or submodule pointer changes to commit');
 	}
 
-
-
 	// Finalize
-	pendingChanges = false;
+	stateManager.processDone();
 	batchTimer = null;
 }
 
+async function pullUpdates() {
+	logInfo('Attempting to pull latest changes...');
 
-
-
-
-
-
-
-// File change handler
-function onChange(event, filePath) {
-
-	logInfo(`Detected ${event} on ${filePath}`);
-	pendingChanges = true;
-	if (batchTimer) {
-		clearTimeout(batchTimer);
-		logInfo('Cleared previous batch timer');
+	try {
+		await git.pull('origin', 'main');
+		logInfo('Pulled latest changes in superproject');
+	} catch (e) {
+		logWarn(`Failed to pull superproject: ${e.message}`);
 	}
-	batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
-	logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
+	for (const sub of submodules) {
+		try {
+			const currentBranch = (await sub.git.branchLocal()).current;
+			if (currentBranch !== 'main') {
+				logWarn(`Skipping pull in ${sub.path} (not on main)`);
+				continue;
+			}
+
+			await sub.git.pull('origin', 'main');
+			logInfo(`Pulled latest changes in submodule ${sub.path}`);
+		} catch (e) {
+			logWarn(`Failed to pull submodule ${sub.path}: ${e.message}`);
+		}
+	}
+
+	stateManager.processDone();
 }
+
 
 // Main
 (async () => {
 	await verifyRepo();
 	await writeStatsFile(await generateStatsData());
 
+	await stateManager.init();
 	logInfo('Initialization complete. Watching for changes...');
 	chokidar.watch(WATCH_DIR, { ignored: IGNORED, persistent: true, ignoreInitial: true })
-		.on('all', onChange);
+		.on('all', stateManager.onChange.bind(stateManager));
+
+	pullTimer = setInterval(() => stateManager.maybePull(), PULL_INTERVAL_MS);
 })();
