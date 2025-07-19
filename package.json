@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "chokidar": "^3.5.3",
+    "recursive-readdir": "^2.2.3",
     "simple-git": "^3.19.0"
   },
   "author": "Lucas Ferguson",
