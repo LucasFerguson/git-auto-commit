@@ -24,6 +24,20 @@ function logError(msg) { console.error(`[ERROR] ${msg}`); }
 let batchTimer = null;
 let pendingChanges = false;
 
+class StateManager {
+	constructor() {
+		this.currentState = "idle";
+		// "idle"
+		// "pending" – changes detected, waiting to commit
+		// "committing"
+		// "pulling"
+		// "blocked" – bad repo state (detached head, merge conflict, etc.)
+		// "error" – encountered unrecoverable error (optional)
+		this.commitTimeout = null;
+		this.timeoutDelay = 5000;
+	}
+}
+
 // Pre-checks before watching
 async function verifyRepo() {
 	try {
@@ -178,77 +192,141 @@ async function writeStatsFile(data) {
 	logInfo(`Stats saved to ${STATS_FILE}`);
 }
 
-// Batched commit function
+// Batched commit and push function
 async function batchedCommit() {
 	if (!pendingChanges) return;
 	logInfo('Performing batched commit...');
 
-	// Create commit message JSON object
-	const commitObj = {
+	// Create base commit message object
+	const baseCommitObj = {
 		author: 'pve3 Obsidian-Phone',
 		date: new Date().toISOString().replace('T', ' ').slice(0, 19),
-		numFiles: 0,
-		lines: {
-			added: 0,
-			removed: 0
-		},
+		lines: { added: 0, removed: 0 },
 	};
 
-	// 1) Commit submodules programmatically
-	const submodStatus = (await git.raw(['submodule', 'status', '--recursive'])).trim().split('\n').filter(Boolean);
+	// 1) Commit & push submodules
+	const submodStatus = (await git.raw(['submodule', 'status', '--recursive']))
+		.trim().split('\n').filter(Boolean);
 	const folderNames = submodStatus.map(line => {
-		// Remove leading status symbol (+, -, or space)
 		const cleaned = line.replace(/^[-+ ]/, '').trim();
-		// Folder name is the second part after the hash
-		return cleaned.split(' ')[1];
+		return cleaned.split(/\s+/)[1] || '';
 	});
 	logInfo(`Submodule folders: ${folderNames.join(', ')}`);
 
 	for (const folderName of folderNames) {
 		const subPath = path.join(WATCH_DIR, folderName);
+		if (!fs.existsSync(subPath)) {
+			logWarn(`Skipping missing submodule path: ${folderName}`);
+			continue;
+		}
+
 		const subGit = simpleGit(subPath);
-		const status = await subGit.status();
-		if (status.files.length > 0) {
+		const statusSummary = await subGit.status();
+		const currentBranch = (await subGit.branchLocal()).current;
+
+		if (statusSummary.files.length > 0) {
 			await subGit.add('.');
-			commitObj.numFiles = status.files.length;
+			const commitObj = {
+				...baseCommitObj,
+				numFiles: statusSummary.files.length,
+			};
+			const commitMsg = JSON.stringify(commitObj);
 
-			commitObj.lines.added += status.insertions || 0;
-			commitObj.lines.removed += status.deletions || 0;
+			try {
+				await subGit.commit(commitMsg);
+				logInfo(`Committed submodule ${folderName}, with message: "${commitMsg}"`);
+			} catch (e) {
+				logWarn(`Failed to commit submodule ${folderName}: ${e.message}`);
+				continue;
+			}
 
-			const commitMsg = `${JSON.stringify(commitObj)}`;
-			await subGit.commit(commitMsg);
-			logInfo(`Committed submodule ${folderName}, with message: "${commitMsg}"`);
+			if (currentBranch !== 'main') {
+				try {
+					await subGit.checkout('main');
+					logInfo(`Checked out 'main' in submodule ${folderName}`);
+				} catch (e) {
+					logWarn(`Failed to checkout 'main' in submodule ${folderName}: ${e.message}`);
+					continue;
+				}
+			}
+
+			try {
+				await subGit.push('origin', 'main');
+				logInfo(`Pushed submodule ${folderName} to main`);
+			} catch (e) {
+				logWarn(`Failed to push submodule ${folderName}: ${e.message}`);
+			}
+		} else {
+			logInfo(`No changes to commit in submodule ${folderName}`);
 		}
 	}
 
-	// 2) Commit superproject
-	const status = await git.status();
-	if (status.files.length > 0) {
+
+	// 2) Commit & push superproject
+	const mainStatus = await git.status();
+
+	const hasChanges =
+		mainStatus.files.length > 0 ||
+		(mainStatus.submodules && mainStatus.submodules.length > 0);
+
+	if (hasChanges) {
 		await git.add('.');
-		commitObj.numFiles = status.files.length;
-		const commitMsg = `${JSON.stringify(commitObj)}`;
-		await git.commit(commitMsg);
-		logInfo('Superproject committed, with message: "' + commitMsg + '"');
+
+		const commitObj = {
+			...baseCommitObj,
+			numFiles: mainStatus.files.length,
+			numSubmodules: mainStatus.submodules?.length || 0,
+		};
+		const commitMsg = JSON.stringify(commitObj);
+
+		try {
+			await git.commit(commitMsg);
+			logInfo(`Superproject committed, with message: "${commitMsg}"`);
+		} catch (e) {
+			logWarn(`Failed to commit superproject: ${e.message}`);
+			return;
+		}
+
+		const branch = (await git.branchLocal()).current;
+		if (branch) {
+			try {
+				await git.push('origin', branch);
+				logInfo(`Superproject pushed to ${branch}`);
+			} catch (e) {
+				logWarn(`Failed to push superproject: ${e.message}`);
+			}
+		} else {
+			logWarn('Superproject is in a detached HEAD; skipping push.');
+		}
 	} else {
-		logInfo('No superproject changes to commit');
+		logInfo('No superproject or submodule pointer changes to commit');
 	}
 
-	// // Refresh stats
-	// const statsData = await generateStatsData();
-	// await writeStatsFile(statsData);
 
+
+	// Finalize
 	pendingChanges = false;
 	batchTimer = null;
 }
 
+
+
+
+
+
+
+
 // File change handler
 function onChange(event, filePath) {
+
 	logInfo(`Detected ${event} on ${filePath}`);
 	pendingChanges = true;
-	if (!batchTimer) {
-		batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
-		logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
+	if (batchTimer) {
+		clearTimeout(batchTimer);
+		logInfo('Cleared previous batch timer');
 	}
+	batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
+	logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
 }
 
 // Main
