@@ -9,8 +9,8 @@ const recursive = require('recursive-readdir');
 // Configuration
 const WATCH_DIR = process.cwd();
 const IGNORED = /(^|[\/\\])\.git/;
-const STATS_FILE = path.join(WATCH_DIR, 'repo-stats.txt');
-const BATCH_INTERVAL_MS = .25 * 60 * 1000;
+const STATS_FILE = path.join(WATCH_DIR, 'repo-stats.md');
+const BATCH_INTERVAL_MS = 1 * 60 * 1000;
 const PULL_INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 
 // Initialize Git
@@ -93,13 +93,14 @@ class StateManager {
 	// File change handler
 	onChange(event, filePath) {
 		this.setState("pending");
-		logInfo(`Detected ${event} on ${filePath}`);
+		let message = `File ${filePath} changed: ${event}`;
 		if (batchTimer) {
 			clearTimeout(batchTimer);
-			logInfo('Cleared previous batch timer');
+			message += ' (previous batch timer cleared)';
 		}
 		batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
-		logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
+		message += ` (next commit in ${BATCH_INTERVAL_MS / 60000} minutes)`;
+		logInfo(message);
 	}
 }
 
@@ -378,8 +379,8 @@ async function batchedCommit() {
 	}
 
 	// Finalize
-	stateManager.processDone();
 	batchTimer = null;
+	stateManager.processDone();
 }
 
 async function pullUpdates() {
