@@ -8,25 +8,21 @@ const recursive = require('recursive-readdir');
 
 // Configuration
 const WATCH_DIR = process.cwd();
-const COMMIT_MSG_SUPER = 'Auto‑commit in superproject';
 const IGNORED = /(^|[\/\\])\.git/;
-const DEBOUNCE_MS = 500;
 const STATS_FILE = path.join(WATCH_DIR, 'repo-stats.txt');
+const BATCH_INTERVAL_MS = .25 * 60 * 1000;
 
 // Initialize Git
 const git = simpleGit(WATCH_DIR);
-
-// Debounce helper
-let commitTimeout;
-function debounce(fn) {
-	clearTimeout(commitTimeout);
-	commitTimeout = setTimeout(fn, DEBOUNCE_MS);
-}
 
 // Verbose logging helpers
 function logInfo(msg) { console.log(`[INFO] ${msg}`); }
 function logWarn(msg) { console.warn(`[WARN] ${msg}`); }
 function logError(msg) { console.error(`[ERROR] ${msg}`); }
+
+// Global batch timer
+let batchTimer = null;
+let pendingChanges = false;
 
 // Pre-checks before watching
 async function verifyRepo() {
@@ -99,105 +95,168 @@ async function verifyRepo() {
 			process.exit(1);
 		}
 
+
+		// ———————— FIX “dubious ownership” —————————
+		// Parse every 'path = …' from .gitmodules, and for each existing folder
+		if (fs.existsSync(gmPath)) {
+			const gm = fs.readFileSync(gmPath, 'utf8');
+			const pathRe = /^\s*path\s*=\s*(.+)$/gm;
+			let m;
+			while ((m = pathRe.exec(gm)) !== null) {
+				const subRel = m[1].trim();
+				const subFull = path.join(WATCH_DIR, subRel);
+				if (fs.existsSync(subFull)) {
+					try {
+						// mark as safe.directory
+						await git.raw([
+							'config', '--global', '--add',
+							'safe.directory', subFull
+						]);
+						logInfo(`Marked submodule safe.directory: ${subRel}`);
+					} catch (e) {
+						logWarn(`Could not mark ${subRel} safe: ${e.message}`);
+					}
+				} else {
+					logWarn(`Skipping nonexistent submodule path: ${subRel}`);
+				}
+			}
+		}
+
+		// Finally, mark the superproject itself too
+		try {
+			await git.raw([
+				'config', '--global', '--add',
+				'safe.directory', WATCH_DIR
+			]);
+			logInfo('Marked superproject safe.directory');
+		} catch (e) {
+			logWarn(`Could not mark superproject safe: ${e.message}`);
+		}
+		// ————————————————————————————————————————
+
+
+
 	} catch (err) {
 		logError(`Repository verification failed: ${err.message}`);
 		process.exit(1);
 	}
 }
 
-// Generate fun statistics about the repo
-async function generateStats() {
-	logInfo('Generating repository statistics...');
-
-	// 1) Count files by extension
+// Generate repository stats, returning report data
+async function generateStatsData() {
 	const allFiles = await recursive(WATCH_DIR, ['.git']);
 	const counts = {};
 	allFiles.forEach(file => {
 		const ext = path.extname(file).toLowerCase() || 'no_ext';
 		counts[ext] = (counts[ext] || 0) + 1;
 	});
-
-	// 2) Repo age and last commit
-	const log = await git.log({ maxCount: 1 });
-	const lastCommitDate = new Date(log.latest.date);
-	const now = new Date();
-	const ageDays = Math.floor((now - new Date((await git.raw(['rev-list', '--max-parents=0', 'HEAD'])).trim())) / (1000 * 60 * 60 * 24));
-
-	// 3) Total folders
-	const dirs = new Set(allFiles.map(f => path.dirname(f)));
-
-	// 4) Other fun stats
 	const totalFiles = allFiles.length;
-	const totalDirs = dirs.size;
-	const topExt = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
 
-	// Build report
+	const logResult = await git.log({ maxCount: 1 });
+	const lastCommitDate = new Date(logResult.latest.date);
+	const firstCommitHash = (await git.raw(['rev-list', '--max-parents=0', 'HEAD'])).trim();
+	const firstDate = new Date((await git.raw(['show', '-s', '--format=%ci', firstCommitHash])).trim());
+	const ageDays = Math.floor((new Date() - firstDate) / (1000 * 60 * 60 * 24));
+
+	return { counts, totalFiles, lastCommitDate, ageDays };
+}
+
+async function writeStatsFile(data) {
+	const { counts, totalFiles, lastCommitDate, ageDays } = data;
+	const dirs = new Set(Object.keys(counts).map(() => { })); // placeholder
 	let report = 'Repository Statistics Report\n';
 	report += '===========================\n';
-	report += `Generated on: ${now.toISOString()}\n\n`;
+	report += `Generated on: ${new Date().toISOString()}\n\n`;
 	report += `Total files: ${totalFiles}\n`;
-	report += `Total directories: ${totalDirs}\n`;
 	report += `Last commit date: ${lastCommitDate.toISOString()}\n`;
 	report += `Repository age: ${ageDays} days since first commit\n`;
-	report += `Most common extension: ${topExt[0]} (${topExt[1]} files)\n\n`;
-	report += 'Files by extension:\n';
+	report += `Files by extension:\n`;
 	for (const [ext, count] of Object.entries(counts)) {
 		report += `  ${ext}: ${count}\n`;
 	}
-
-	// Write to file
 	fs.writeFileSync(STATS_FILE, report, 'utf8');
-	logInfo(`Statistics written to ${STATS_FILE}`);
+	logInfo(`Stats saved to ${STATS_FILE}`);
 }
 
-// Auto‑commit handler
-async function autoCommit() {
-	try {
-		logInfo('Starting auto‑commit sequence...');
+// Batched commit function
+async function batchedCommit() {
+	if (!pendingChanges) return;
+	logInfo('Performing batched commit...');
 
-		// 1) Handle submodules recursively
-		logInfo('Checking submodules for changes...');
-		await git.raw(['submodule', 'foreach', '--recursive',
-			'bash -lc "if [ -n \"$(git status --porcelain)\" ]; then ' +
-			'git add -A && git commit -m \"Auto‑commit in submodule $(basename `pwd`)\" && ' +
-			'echo \"[INFO] Committed in submodule $(basename `pwd`)\"; fi"'
-		]);
+	// Create commit message JSON object
+	const commitObj = {
+		author: 'pve3 Obsidian-Phone',
+		date: new Date().toISOString().replace('T', ' ').slice(0, 19),
+		numFiles: 0,
+		lines: {
+			added: 0,
+			removed: 0
+		},
+	};
 
-		// 2) Handle superproject
-		logInfo('Checking superproject for changes...');
-		const status = await git.status();
+	// 1) Commit submodules programmatically
+	const submodStatus = (await git.raw(['submodule', 'status', '--recursive'])).trim().split('\n').filter(Boolean);
+	const folderNames = submodStatus.map(line => {
+		// Remove leading status symbol (+, -, or space)
+		const cleaned = line.replace(/^[-+ ]/, '').trim();
+		// Folder name is the second part after the hash
+		return cleaned.split(' ')[1];
+	});
+	logInfo(`Submodule folders: ${folderNames.join(', ')}`);
+
+	for (const folderName of folderNames) {
+		const subPath = path.join(WATCH_DIR, folderName);
+		const subGit = simpleGit(subPath);
+		const status = await subGit.status();
 		if (status.files.length > 0) {
-			logInfo(`Found ${status.files.length} changed files in superproject.`);
-			await git.add('.');
-			await git.commit(COMMIT_MSG_SUPER);
-			logInfo('Committed changes in superproject.');
-		} else {
-			logInfo('No changes to commit in superproject.');
-		}
+			await subGit.add('.');
+			commitObj.numFiles = status.files.length;
 
-		logInfo('Auto‑commit sequence completed.');
-	} catch (err) {
-		logError(`Auto‑commit error: ${err.message}`);
+			commitObj.lines.added += status.insertions || 0;
+			commitObj.lines.removed += status.deletions || 0;
+
+			const commitMsg = `${JSON.stringify(commitObj)}`;
+			await subGit.commit(commitMsg);
+			logInfo(`Committed submodule ${folderName}, with message: "${commitMsg}"`);
+		}
+	}
+
+	// 2) Commit superproject
+	const status = await git.status();
+	if (status.files.length > 0) {
+		await git.add('.');
+		commitObj.numFiles = status.files.length;
+		const commitMsg = `${JSON.stringify(commitObj)}`;
+		await git.commit(commitMsg);
+		logInfo('Superproject committed, with message: "' + commitMsg + '"');
+	} else {
+		logInfo('No superproject changes to commit');
+	}
+
+	// // Refresh stats
+	// const statsData = await generateStatsData();
+	// await writeStatsFile(statsData);
+
+	pendingChanges = false;
+	batchTimer = null;
+}
+
+// File change handler
+function onChange(event, filePath) {
+	logInfo(`Detected ${event} on ${filePath}`);
+	pendingChanges = true;
+	if (!batchTimer) {
+		batchTimer = setTimeout(batchedCommit, BATCH_INTERVAL_MS);
+		logInfo(`Scheduled batched commit in ${BATCH_INTERVAL_MS / 60000} minutes`);
 	}
 }
 
-// Main entrypoint
+// Main
 (async () => {
 	await verifyRepo();
-	await generateStats();
+	await writeStatsFile(await generateStatsData());
 
-	logInfo(`Initialization complete. You may now start editing.`);
-	logInfo(`Watching ${WATCH_DIR} for changes (excluding '.git')…`);
-	chokidar.watch(WATCH_DIR, {
-		ignored: IGNORED,
-		persistent: true,
-		ignoreInitial: true,
-	})
-		.on('all', (event, filePath) => {
-			logInfo(`Detected ${event} on ${filePath}`);
-			debounce(async () => {
-				await autoCommit();
-				await generateStats();
-			});
-		});
+	logInfo('Initialization complete. Watching for changes...');
+	chokidar.watch(WATCH_DIR, { ignored: IGNORED, persistent: true, ignoreInitial: true })
+		.on('all', onChange);
 })();
