@@ -410,6 +410,33 @@ async function pullUpdates() {
 	stateManager.processDone();
 }
 
+async function gracefulShutdown(signal) {
+	logInfo(`Received ${signal}, shutting down...`);
+
+	const dangerousStates = ['committing', 'pulling'];
+
+	if (dangerousStates.includes(stateManager.currentState)) {
+		logInfo(`Currently ${stateManager.currentState}, waiting for it to finish...`);
+
+		await new Promise(resolve => {
+			const check = setInterval(() => {
+				if (!dangerousStates.includes(stateManager.currentState)) {
+					clearInterval(check);
+					resolve();
+				}
+			}, 500);
+		});
+
+		logInfo('Safe to exit now. Goodbye!');
+	} else {
+		logInfo('No dangerous operations in progress. Goodbye!');
+	}
+
+	process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Main
 (async () => {
@@ -423,3 +450,4 @@ async function pullUpdates() {
 
 	pullTimer = setInterval(() => stateManager.maybePull(), PULL_INTERVAL_MS);
 })();
+
