@@ -292,7 +292,7 @@ async function batchedCommit() {
 	for (const folderName of folderNames) {
 		const subPath = path.join(WATCH_DIR, folderName);
 		if (!fs.existsSync(subPath)) {
-			logWarn(`Skipping missing submodule path: ${folderName}`);
+			logError(`Skipping missing submodule path: ${folderName}`);
 			continue;
 		}
 
